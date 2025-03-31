@@ -1,0 +1,116 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+  labels:
+    app: app
+spec:
+  selector:
+    matchLabels:
+      app: app
+  template:
+    metadata:
+      labels:
+        app: app
+    spec:
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: topology.kubernetes.io/zone
+                operator: In
+                values:
+                - ru-central1-a
+                - ru-central1-b
+                - ru-central1-d  # Разрешаем размещение подов на распределенных по зонам узлах. Пример взят из Yandex cloud
+            topologyKey: topology.kubernetes.io/zone # На кажддом узле необходимо установить метку topology.kubernetes.io/zone если кластер не облачный
+
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+            - labelSelector:
+                matchExpressions:
+                - key: app
+                operator: In
+                values:
+                - app   # Запрещаем размещение подов на узлах, где уже имеется под с меткой app=app
+              topologyKey: kubernetes.io/hostname
+
+      serviceAccountName: app
+      replicas: 1
+      securityContext:
+        fsGroup: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: server
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            privileged: false
+            readOnlyRootFilesystem: true
+          image: app:version_number   # Указать репозиторий, имя образа и версию 
+          ports:
+          - containerPort: 8080 # Указать порт приложения в контейнере
+          resources:
+            limits:
+              cpu: 1000m # на первые запросы приложению требуется значительно больше ресурсов CPU
+              memory: 128Mi # По памяти всегда “ровно” в районе 128M memory
+            requests:
+              cpu: 100m # в дальнейшем потребление ровное в районе 0.1 CPU
+              memory: 64Mi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  labels:
+    app: app
+spec:
+  type: ClusterIP
+  selector:
+    app: app
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: frontend
+---
+apiVersion: autoscaling/v2beta2
+kind: HorizontalPodAutoscaler
+metadata:
+ name: app-hpa
+spec:
+ behavior:
+  scaleUp:
+   stabilizationWindowSeconds: 10 # приложение требует около 5-10 секунд для инициализации, взял время по максимальному значению для уверенности в инициализации
+  scaleDown:
+   stabilizationWindowSeconds: 10 # Переиспользование default значения (300 sec) для минимизации использования ресурсов 
+   policies:
+   - type: Percent # Убираем лавинный всплеск нагруки из-за выключения "лишних" подов
+     value: 25 #   Максимум выключим 1 под за раз
+     periodSeconds: 20 # в случае снижения нагрузки до 1 пода выключение остальных выполнится за 1 минуту 
+ maxReplicas: 4 # по результатам нагрузочного теста известно, что 4 пода справляются с пиковой нагрузкой
+ minReplicas: 1 # количество реплик для минимальной нагрузки (ночь)
+ scaleTargetRef:
+   apiVersion: apps/v1
+   kind: Deployment
+   name: app
+ metrics:
+ - type: Resource
+   resource:
+     name: cpu
+     target:
+       type: Utilization
+       averageUtilization: 80 # 
